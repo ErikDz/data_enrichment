@@ -5,7 +5,7 @@ import re
 import time
 import json
 import sys
-import math
+# import math
 import unicodedata
 import urllib.parse
 import urllib.robotparser
@@ -65,7 +65,7 @@ STRICT_DOMAIN_ONLY = False  # TRUE = only keep emails that match the domain
 MAX_PERSON_LINKS = 20  # max person-relevant links to follow per site
 VERBOSE = True  # set True for detailed logs during testing
 MAX_ROWS_TO_PROCESS = 0  # limit number of Analyse rows processed (None or 0 = unlimited)
-POST_COMPANY_SLEEP_S = 5  # wait between companies to reduce API pressure during testing
+POST_COMPANY_SLEEP_S = 3  # wait between companies to reduce API pressure during testing
 LLM_MAX_PAGES = 2  # limit number of pages to send to LLM per site to reduce calls (0 = unlimited)
 
 # LLM config
@@ -118,10 +118,81 @@ def _domain_core_from_host(host: str) -> str:
 
 
 def same_company_domain(site_url: str, email_domain: str) -> bool:
-    # softened match: compare normalized “core” domain (no hyphens/underscores/etc.)
-    site_core = _domain_core_from_url(site_url)
-    email_core = _domain_core_from_host(email_domain)
-    return bool(site_core and email_core and site_core == email_core)
+    """Lenient matching to decide if an email domain likely belongs to the same business.
+
+    Acceptance rules (to exclude only clearly unrelated partner companies):
+    1) Same domain family different TLD: accept if second-level domain cores match
+       (e.g., fischbach-miller.shop ↔ fischbach-miller.de).
+    2) Parent brand or subdomain relationship: accept if one is a subdomain of the other
+       or they share the same brand namespace (e.g., heads.volu-med.studio → volu-med.com).
+    3) Official secondary domain (business ecosystem): accept if brand base matches even if
+       structure differs (e.g., hairbyclaireshop.de → hairbyclaire.de).
+    """
+    try:
+        import re as _re
+        import tldextract as _tld
+
+        def _norm_core(s: str) -> str:
+            return _re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+        def _extract(url_or_host: str):
+            if not url_or_host:
+                return "", "", "", ""
+            ext = _tld.extract(url_or_host if _re.match(r"^https?://", str(url_or_host)) else ("http://" + str(url_or_host)))
+            domain = (ext.domain or "").lower()
+            suffix = (ext.suffix or "").lower()
+            sub = (ext.subdomain or "").lower()
+            host = ((domain + "." + suffix) if domain and suffix else domain)
+            return sub, domain, suffix, host
+
+        # Tokens considered generic add-ons rather than brand-identifiers
+        GENERIC_TOKENS = {
+            "shop","store","studio","wigs","hair","salon","beauty","clinic","praxis","co","group","gmbh","ug","mbh","ag","ev","kg","ohg","se","kgaa"
+        }
+
+        def _brand_tokens(domain: str):
+            toks = [t for t in _re.split(r"[^a-z0-9]+", domain.lower()) if t]
+            return [t for t in toks if t not in GENERIC_TOKENS]
+
+        def _jaccard(a: set, b: set) -> float:
+            if not a or not b:
+                return 0.0
+            inter = len(a & b)
+            denom = max(len(a), len(b))
+            return inter / denom if denom else 0.0
+
+        s_sub, s_dom, s_suf, s_host = _extract(site_url)
+        e_sub, e_dom, e_suf, e_host = _extract(email_domain)
+        if not e_dom:
+            return False
+
+        # Rule 1: Same second-level domain (ignoring TLD and punctuation)
+        if _norm_core(s_dom) and _norm_core(s_dom) == _norm_core(e_dom):
+            return True
+
+        # Rule 2a: Direct subdomain relationship on full host
+        if s_host and e_host and (e_host.endswith(s_host) or s_host.endswith(e_host)):
+            return True
+
+        # Rule 2b/3: Brand-core similarity (namespace sharing / official secondary domain)
+        s_tokens = _brand_tokens(s_dom)
+        e_tokens = _brand_tokens(e_dom)
+        if s_tokens and e_tokens:
+            # If concatenated brand strings contain each other, accept
+            s_join = "".join(s_tokens)
+            e_join = "".join(e_tokens)
+            if s_join in e_join or e_join in s_join:
+                return True
+            # If token Jaccard similarity is high, accept
+            if _jaccard(set(s_tokens), set(e_tokens)) >= 0.6:
+                return True
+
+        return False
+    except Exception:
+        # Fallback to strict core equality if anything goes wrong
+        site_core = _domain_core_from_url(site_url)
+        email_core = _domain_core_from_host(email_domain)
+        return bool(site_core and email_core and site_core == email_core)
 
 def email_allowed(site_url: str, email_addr: str) -> bool:
     if not email_addr or '@' not in email_addr:
@@ -250,7 +321,7 @@ def prioritize_person_links(links: List[str]) -> List[str]:
 
 
 def extract_mailto_emails_from_dom(page, site_url: str) -> Set[str]:
-    items = page.eval_on_selector_all('a[href^="mailto:" ]', "els => els.map(e => e.getAttribute('href'))")
+    items = page.eval_on_selector_all('a[href^="mailto:"]', "els => els.map(e => e.getAttribute('href'))")
     out = set()
     for href in items or []:
         try:
@@ -338,32 +409,27 @@ def llm_chat_text(llm: LLMClient, system_prompt: str, user_prompt: str) -> str:
 # LLM prompts
 # =====================
 PERSON_SYS = (
-    "Du bist ein präziser Extraktionsassistent. Extrahiere PERSONEN aus Webseiteninhalten.\n"
-    "Regeln: \n"
-    "- Gib ausschließlich Informationen zurück, die im Text vorhanden sind. Keine Halluzinationen.\n"
-    "- E-Mail-Adressen nur aus dem bereitgestellten Text/Linkliste. Keine Ableitungen oder Vermutungen.\n"
-    "- Vornamen und Nachnamen als separate Felder.\n"
-    "- Rolle/Funktion der Person im Unternehmen als 'role' (z. B. Verantwortlicher, Geschäftsführer, Inhaber, Assistenz), wenn erkennbar.\n"
-    "- Geschlecht: male | female | unknown (nur wenn klar erkennbar).\n"
-    "- Generiere das Feld 'salutation' NUR nach diesen Regeln:\n"
-    "  * Wenn gender = female und last_name vorhanden: 'Sehr geehrte Frau [last_name]'.\n"
-    "  * Wenn gender = male und last_name vorhanden: 'Sehr geehrter Herr [last_name]'.\n"
-    "  * Wenn gender = female und last_name fehlt: 'Liebe [first_name]'.\n"
-    "  * Wenn gender = male und last_name fehlt: 'Lieber [first_name]'.\n"
-    "  * Ansonsten: leere Zeichenkette.\n"
-    "- Sprache: Deutsch.\n"
+    "Du bist ein Extraktionsassistent für deutschsprachige Webseiten (Impressum/Kontakt/Team). Arbeite ausschließlich mit den bereitgestellten Kontextfenstern.\n"
+    "Regeln:\n"
+    "- Extrahiere NUR Entscheidungsträger/innen mit klaren Rollen: Verantwortlich/inhaltlich verantwortlich, Inhaber/Inhaberin, Geschäftsführer/Geschäftsführerin, Geschäftsführung, Kontoinhaber, Leitung.\n"
+    "- Wenn keine Person mit einer dieser Rollen eindeutig genannt ist, gib 'people': [] zurück (nicht raten, nicht erzwingen).\n"
+    "- Erkenne Personennamen (2–4 Tokens, Großschreibung; Umlaut/ß/Bindestriche erlaubt). Bewahre Diakritika.\n"
+    "- Behandle Rechtsformzusätze wie 'GmbH', 'UG', 'mbH', 'AG', 'e.V.', 'GbR', 'KG', 'OHG', 'SE' niemals als Vor- oder Nachnamen.\n"
+    "- Erwähne oder extrahiere KEINE Firmen- oder Dienstleister-Namen. Nur natürliche Personen.\n"
+    "- Gib nur Informationen zurück, die in den Fenstern vorkommen. Keine Halluzinationen.\n"
+    "- E-Mail nur, wenn sie in 'Bekannte E-Mails' oder im Fenstertext vorkommt.\n"
+    "- Felder pro Person: first_name, last_name, role, gender, email, salutation.\n"
+    "- gender: male | female | unknown (nur wenn klar erkennbar).\n"
+    "- salutation-Regeln: female+Nachname => 'Sehr geehrte Frau [Nachname]'; male+Nachname => 'Sehr geehrter Herr [Nachname]'; female ohne Nachname => 'Liebe [Vorname]'; male ohne Nachname => 'Lieber [Vorname]'; sonst ''.\n"
     "Format: JSON-Objekt mit Feld 'people' = Liste von Personenobjekten.\n"
 )
-
 PERSON_USER_TMPL = (
     "Website: {site_url}\n"
     "Seite: {page_url}\n"
-    "Bekannte E-Mail-Adressen (auf dieser Seite gefunden): {emails}\n\n"
-    "Inhalt (abgeschnitten):\n{page_text}\n\n"
+    "Bekannte E-Mails: {emails}\n\n"
+    "Kontextfenster (Leerzeichen normalisiert, Diakritika erhalten):\n{windows}\n\n"
     "Gib ein JSON-Objekt mit: people: [{{first_name, last_name, role, gender, email, salutation}}].\n"
-    "- email nur, wenn in den bereitgestellten E-Mails enthalten ODER eindeutig im Text vorhanden.\n"
-    "- salutation 'formal' oder 'informal' in Bezug auf diese Person.\n"
-    "- Keine weiteren Felder.\n"
+    "- Bevorzuge die am höchsten priorisierten Labels. Wenn mehrere Personen vorkommen, nenne bis zu 3 mit klarer Rolle.\n"
 )
 
 COMPANY_SYS = (
@@ -382,11 +448,11 @@ COMPANY_USER_TMPL = (
 ICEBREAKER_SYS_PLAIN = (
     "Schreibe 1–2 sehr kurze, personalisierte und DSGVO-konforme Sätze auf Deutsch.\n"
     "Regeln:\n"
+    "- Schreibe wie eine persönliche Beobachtung eines Besuchers (z. B. 'Mir ist aufgefallen …', 'Ich finde super …'), nicht wie ein Slogan.\n"
+    "- Beziehe dich auf ein konkretes Detail (Leistungen, Spezialisierung, Besonderheiten), vermeide Werbesprache und Superlative.\n"
     "- Verwende nur Inhalte aus dem bereitgestellten Startseitentext; keine Erfindungen.\n"
     "- Nenne NICHT den Unternehmensnamen oder Ort.\n"
-    "- Ziel: Es soll so wirken, als hätten wir die Website persönlich angesehen.\n"
-    "- Wenn nichts Konkretes vorhanden ist, gib eine leere Zeichenkette zurück (\"\").\n"
-    "- Gib NUR den Satz bzw. die Sätze aus, kein JSON, keine Erklärungen."
+    "- Maximal 150 Zeichen. Gib NUR den Satz bzw. die Sätze aus, kein JSON, keine Erklärungen."
 )
 
 ICEBREAKER_USER_PLAIN = (
@@ -395,6 +461,157 @@ ICEBREAKER_USER_PLAIN = (
     "Gib NUR den Satz/die Sätze aus. Kein JSON."
 )
 
+
+# =====================
+# Kontextfenster & Fallback-Personenerkennung
+# =====================
+
+ANCHOR_TERMS = [
+    r"\bverantwortlich(?:e|er)?\b",
+    r"\binhaber(?:in)?\b",
+    r"\bgeschäftsführer(?:in)?\b",
+    r"\bansprechpartner(?:in)?\b",
+    r"\bkontoinhaber\b",
+    r"\bgeschäftsführung\b",
+    r"\bleitung\b",
+    r"\b(unser|ihr|das)\s+team\b",
+    r"\bteam\b",
+    r"\bimpressum\b",
+    r"\bdatenschutz\b",
+    r"\bkontakt\b",
+    r"\biban\b",
+]
+
+def _normalize_nfc_spaces(text: str) -> str:
+    t = unicodedata.normalize("NFC", text or "")
+    t = re.sub(r"\s+", " ", t)
+    return t.strip()
+
+def _find_spans(rx: re.Pattern, text: str):
+    return [m.span() for m in rx.finditer(text)]
+
+def _merge_ranges(ranges: List[Tuple[int, int]], radius: int, length: int) -> List[Tuple[int, int]]:
+    expanded = []
+    for s, e in ranges:
+        s2 = max(0, s - radius)
+        e2 = min(length, e + radius)
+        expanded.append((s2, e2))
+    expanded.sort()
+    merged: List[Tuple[int, int]] = []
+    for s, e in expanded:
+        if not merged or s > merged[-1][1] + 10:
+            merged.append([s, e])
+        else:
+            merged[-1][1] = max(merged[-1][1], e)
+    return [(s, e) for s, e in merged]
+
+def build_context_windows(text: str, radius: int = 600, max_windows: int = 20) -> List[str]:
+    t = _normalize_nfc_spaces(text)
+    spans: List[Tuple[int, int]] = []
+    spans.extend([m.span() for m in EMAIL_RE.finditer(t)])
+    for pat in ANCHOR_TERMS:
+        spans.extend([m.span() for m in re.finditer(pat, t, flags=re.IGNORECASE)])
+    if not spans:
+        return [t[:2000]] if t else []
+    ranges = _merge_ranges(spans, radius, len(t))
+    # Score ranges: prioritize those containing high-signal labels and emails
+    def score_range(r: Tuple[int, int]) -> Tuple[int, int]:
+        s, e = r
+        w = t[s:e]
+        pri = 0
+        if re.search(r"\bverantwortlich", w, re.I): pri += 5
+        if re.search(r"\binhaber", w, re.I): pri += 4
+        if re.search(r"\bgeschäftsführer", w, re.I): pri += 4
+        if re.search(r"\bkontoinhaber", w, re.I): pri += 3
+        if re.search(EMAIL_RE, w): pri += 1
+        return (-pri, e - s)
+    ranges.sort(key=score_range)
+    selected = ranges[:max_windows]
+    return [t[s:e] for s, e in selected]
+
+NAME_RE = r"([A-ZÄÖÜ][\wÄÖÜäöüß'.-]+(?:\s+[A-ZÄÖÜ][\wÄÖÜäöüß'.-]+){1,3})"
+RESP_PATTERNS = [
+    (re.compile(r"(?i)\bverantwortlich(?:e|er)?\b[:\- ]+" + NAME_RE), "Verantwortlich"),
+    (re.compile(r"(?i)\binhaber(?:in)?\b[:\- ]+" + NAME_RE), "Inhaber/in"),
+    (re.compile(r"(?i)\bgeschäftsführer(?:in)?\b[:\- ]+" + NAME_RE), "Geschäftsführer/in"),
+    (re.compile(r"(?i)\bgeschäftsführung\b[:\- ]+" + NAME_RE), "Geschäftsführung"),
+    (re.compile(r"(?i)\bkontoinhaber\b[:\- ]+" + NAME_RE), "Kontoinhaber"),
+]
+
+def fallback_person(windows: List[str]) -> Tuple[str | None, str | None, str | None]:
+    for w in windows or []:
+        w2 = _normalize_nfc_spaces(w)
+        for rx, label in RESP_PATTERNS:
+            m = rx.search(w2)
+            if m:
+                name = m.group(1).strip(" .,-")
+                # Guard against companies/service providers or non-name tokens
+                fn_tmp, ln_tmp = split_name_simple(name)
+                if not looks_like_person_name(fn_tmp, ln_tmp):
+                    continue
+                i, j = m.span(1)
+                evid = w2[max(0, i-40):min(len(w2), j+40)]
+                return name, label, evid
+    return None, None, None
+
+def split_name_simple(full_name: str) -> Tuple[str, str]:
+    parts = [p for p in (full_name or "").strip().split() if p]
+    if not parts:
+        return "", ""
+    if len(parts) == 1:
+        return parts[0], ""
+    return parts[0], parts[-1]
+
+LEGAL_FORMS = {"gmbh", "mbh", "ug", "ag", "e.v.", "ev", "gbr", "kg", "ohg", "se", "kgaa", "ek", "e.k.", "sarl", "s.a.r.l.", "srl", "s.p.a.", "spa"}
+PROVIDER_BLACKLIST = {"sendinblue", "brevo", "mailchimp", "mailerlite", "hubspot", "google", "meta", "facebook", "instagram", "linkedin", "twitter", "x", "stripe", "paypal", "klarna", "mailjet", "activecampaign", "constant", "brevo"}
+
+# Decision-maker role matcher (German + English variants)
+DECISION_ROLE_RE = re.compile(r"(?i)verantwortlich|inhaber|inhaberin|geschäftsführer|geschaeftsfuehrer|geschäftsführerin|geschaeftsfuehrerin|geschäftsführung|geschaeftsfuehrung|kontoinhaber|leitung|owner|founder|ceo")
+
+# German stopwords and pronouns that must not be treated as names
+STOPWORD_TOKENS = {
+    "für","der","die","das","und","oder","im","in","am","an","beim","von","vom","zu","zur","zum","mit","ohne","über","ueber","unter","zwischen","gegen","nach","vor","seit","bis","ab","auch",
+    "ihr","ihre","ihrer","ihrem","ihren","euer","eure","eurer","eurem","euren","unser","unsere","unserer","unserem","unseren",
+}
+
+def _starts_upper(token: str) -> bool:
+    return bool(re.match(r"^[A-ZÄÖÜ][\wÄÖÜäöüß'.-]+$", token or ""))
+
+def looks_like_person_name(fn: str, ln: str) -> bool:
+    if not fn or not ln:
+        return False
+    # Filter legal forms / providers
+    if is_legal_name(fn, ln) or is_blacklisted_name(fn, ln):
+        return False
+    # Token checks
+    fn_l = fn.strip().strip('.').lower()
+    ln_l = ln.strip().strip('.').lower()
+    if fn_l in STOPWORD_TOKENS or ln_l in STOPWORD_TOKENS:
+        return False
+    if any(ch.isdigit() for ch in fn) or any(ch.isdigit() for ch in ln):
+        return False
+    # Require typical capitalization (allow particles like 'von', 'de', 'van' as first token)
+    allowed_particles = {"von","van","de","da","di","zu","zur","zum"}
+    fn_ok = _starts_upper(fn) or fn_l in allowed_particles
+    ln_ok = _starts_upper(ln)
+    return fn_ok and ln_ok
+
+def _tokenize_name_tokens(*names: str) -> List[str]:
+    toks: List[str] = []
+    for n in names:
+        for t in (n or "").replace(",", " ").split():
+            t2 = t.strip().strip(".").lower()
+            if t2:
+                toks.append(t2)
+    return toks
+
+def is_legal_name(fn: str, ln: str) -> bool:
+    toks = _tokenize_name_tokens(fn, ln)
+    return any(t in LEGAL_FORMS for t in toks)
+
+def is_blacklisted_name(fn: str, ln: str) -> bool:
+    toks = _tokenize_name_tokens(fn, ln)
+    return any(t in PROVIDER_BLACKLIST for t in toks)
 
 # =====================
 # Excel I/O
@@ -659,7 +876,7 @@ def process_site(site_url: str, company_name: str, llm: LLMClient, wb) -> int:
             if VERBOSE:
                 print(f"[discover] {site_url} -> {len(person_links)} person pages; homepage emails: {len(homepage_emails|mailtos_home)}")
             # Phase 1: pre-scan target pages for emails only (no LLM)
-            target_pages = person_links or [site_url]
+            target_pages = [site_url] + person_links if person_links else [site_url]
             if VERBOSE and target_pages:
                 print(f"[emails] {site_url}: scanning {len(target_pages)} page(s) for emails")
             for url in target_pages:
@@ -711,9 +928,11 @@ def process_site(site_url: str, company_name: str, llm: LLMClient, wb) -> int:
             print(f"[excel] Wrote company-only row after error for {site_url}")
             return 0
 
+        # Prepare homepage snippet once
+        h_text = homepage_text[:MAX_PAGE_TEXT_CHARS]
+
         # Company analysis (summary only)
         try:
-            h_text = homepage_text[:MAX_PAGE_TEXT_CHARS]
             company_payload = COMPANY_USER_TMPL.format(site_url=site_url, homepage_text=h_text)
             company_json = llm.chat_json(COMPANY_SYS, company_payload)
             if isinstance(company_json, dict):
@@ -733,16 +952,13 @@ def process_site(site_url: str, company_name: str, llm: LLMClient, wb) -> int:
                 ICEBREAKER_USER_PLAIN.format(site_url=site_url, homepage_text=h_text),
             )
             icebreaker_sentence = normalize_spaces(raw.strip().strip('"').strip("'"))
-            # sanitize meaningless tokens
-            if icebreaker_sentence.lower() in {"icebreaker", "icebreakersatz"} or len(icebreaker_sentence) < 5:
-                icebreaker_sentence = ""
         except Exception:
             if VERBOSE:
                 print("[info] Icebreaker text fetch failed; leaving empty.")
             icebreaker_sentence = ""
 
         # If no person links found, also analyze homepage as fallback
-        target_pages = person_links or [site_url]
+        target_pages = [site_url] + person_links if person_links else [site_url]
         if VERBOSE and target_pages:
             print(f"[crawl] {site_url}: processing {len(target_pages)} page(s)")
 
@@ -763,16 +979,34 @@ def process_site(site_url: str, company_name: str, llm: LLMClient, wb) -> int:
                 do_llm = (LLM_MAX_PAGES <= 0) or (idx <= LLM_MAX_PAGES)
                 people = []
                 if do_llm:
+                    windows = build_context_windows(page_text, radius=600, max_windows=15)
+                    if VERBOSE:
+                        print(f"[windows] {final}: built {len(windows)} window(s)")
+                    windows_str = "\n".join(f"{i+1}) {w}" for i, w in enumerate(windows)) if windows else page_text[:MAX_PAGE_TEXT_CHARS]
                     payload = PERSON_USER_TMPL.format(
                         site_url=site_url,
                         page_url=final,
                         emails=", ".join(sorted(page_emails)) if page_emails else "(keine)",
-                        page_text=page_text[:MAX_PAGE_TEXT_CHARS]
+                        windows=windows_str
                     )
                     out = llm.chat_json(PERSON_SYS, payload)
                     people = out.get("people", []) if isinstance(out, dict) else []
                     if not isinstance(people, list):
                         people = []
+                    if not people:
+                        fp, flabel, fev = fallback_person(windows)
+                        if fp:
+                            fn_f, ln_f = split_name_simple(fp)
+                            people = [{
+                                "first_name": fn_f,
+                                "last_name": ln_f,
+                                "role": flabel or "",
+                                "gender": "unknown",
+                                "email": "",
+                                "salutation": "",
+                            }]
+                            if VERBOSE:
+                                print(f"[fallback] {final}: matched responsible person via regex: {fp} ({flabel})")
                     if VERBOSE:
                         print(f"[llm] {final}: extracted people = {len(people)}")
                 for p_obj in people:
@@ -783,10 +1017,25 @@ def process_site(site_url: str, company_name: str, llm: LLMClient, wb) -> int:
                             continue
                         role = normalize_spaces(str(p_obj.get("role") or p_obj.get("title") or p_obj.get("position") or ""))
                         email = normalize_spaces(str(p_obj.get("email", ""))).lower()
-                        if email and email not in page_emails and email not in homepage_emails:
-                            email = ""
+                        # Accept any syntactically valid email; only restrict by domain if STRICT_DOMAIN_ONLY is enabled.
+                        if email:
+                            if not EMAIL_RE.search(email):
+                                email = ""
+                            elif STRICT_DOMAIN_ONLY:
+                                edomain = email.split('@')[-1].lower()
+                                if not same_company_domain(site_url, edomain):
+                                    email = ""
                         gender = str(p_obj.get("gender", "unknown")).lower()
                         sal = normalize_spaces(str(p_obj.get("salutation", "")))
+                        # Strong validation: name must look like a person and role must indicate decision-making
+                        if not looks_like_person_name(fn, ln):
+                            if VERBOSE:
+                                print(f"[filter] Rejecting unlikely name: '{fn} {ln}' role='{role}'")
+                            continue
+                        if not DECISION_ROLE_RE.search(role or ""):
+                            if VERBOSE:
+                                print(f"[filter] Rejecting non-decision role: '{fn} {ln}' role='{role}'")
+                            continue
                         if not sal:
                             # Fallback salutation rules
                             if gender == "female":
@@ -840,8 +1089,7 @@ def process_site(site_url: str, company_name: str, llm: LLMClient, wb) -> int:
                 print(f"[excel] Save failed: file appears open/locked: {EXCEL_PATH}")
                 sys.exit(1)
             after_rows = find_next_value_row(people_ws, key_cols) - 1
-            print(f"[excel] {EXCEL_PATH} :: '{OUTPUT_SHEET_NAME}' — wrote {len(people_rows)} row(s), people={found_total}; rows before={before_rows}, after={after_rows}")
-    # ... existing code for people_rows case ...
+            print(f"[excel] {EXCEL_PATH} :: '{OUTPUT_SHEET_NAME}' — wrote {len(people_rows)} row(s), people={len(people_rows)}; rows before={before_rows}, after={after_rows}")
         else:
             # Even if nothing else found, write company + website row with all emails and general salutation
             empty_dict = {
@@ -855,20 +1103,20 @@ def process_site(site_url: str, company_name: str, llm: LLMClient, wb) -> int:
                 "Salutation": "Sehr geehrte Damen und Herren" if merged_emails else "",  # generic if emails present
                 "Emails": "; ".join(sorted(merged_emails)) if merged_emails else "",
                 "Icebreaker sentence": icebreaker_sentence,
-        }
-        append_rows_by_headers(people_ws, header_map, [empty_dict])
-        try:
-            wb.save(EXCEL_PATH)
-        except PermissionError:
-            print(f"[excel] Save failed: file appears open/locked: {EXCEL_PATH}")
-            sys.exit(1)
-        after_rows = find_next_value_row(people_ws, key_cols) - 1
-        print(f"[excel] {EXCEL_PATH} :: '{OUTPUT_SHEET_NAME}' — wrote company-only row; rows before={before_rows}, after={after_rows}")
+            }
+            append_rows_by_headers(people_ws, header_map, [empty_dict])
+            try:
+                wb.save(EXCEL_PATH)
+            except PermissionError:
+                print(f"[excel] Save failed: file appears open/locked: {EXCEL_PATH}")
+                sys.exit(1)
+            after_rows = find_next_value_row(people_ws, key_cols) - 1
+            print(f"[excel] {EXCEL_PATH} :: '{OUTPUT_SHEET_NAME}' — wrote company-only row; rows before={before_rows}, after={after_rows}")
     except PermissionError as pe:
         print(f"[excel] Save failed (is the file open/locked?): {pe}")
         sys.exit(1)
 
-    return found_total
+    return max(found_total, len(people_rows))
 
 
 # =====================
