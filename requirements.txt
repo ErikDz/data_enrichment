@@ -1,0 +1,10 @@
+Flask
+tldextract
+beautifulsoup4
+playwright
+tenacity
+openai
+python-dotenv
+pandas
+openpyxl
+gunicorn

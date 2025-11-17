@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Data Enrichment Service</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>Data Enrichment Service</h1>
+        <div class="card">
+            <h2>1. Upload Excel File</h2>
+            <form id="upload-form" enctype="multipart/form-data">
+                <input type="file" name="file" id="file-input" required>
+                <button type="submit">Upload</button>
+            </form>
+        </div>
+        <div class="card">
+            <h2>2. Control Process</h2>
+            <div class="controls">
+                <button id="start-btn" disabled>Start</button>
+                <button id="stop-btn" disabled>Stop</button>
+            </div>
+        </div>
+        <div class="card">
+            <h2>3. Status & Download</h2>
+            <div id="status-container">
+                <p>Status: <span id="status">stopped</span></p>
+                <p>File: <span id="filename">none</span></p>
+            </div>
+            <button id="download-btn" disabled>Download Enriched File</button>
+        </div>
+        <div class="card">
+            <h2>Logs</h2>
+            <pre id="logs"></pre>
+        </div>
+    </div>
+    <script src="/static/script.js"></script>
+</body>
+</html>
