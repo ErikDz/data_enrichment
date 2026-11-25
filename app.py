@@ -92,6 +92,33 @@ MAILTO_RE = re.compile(r"^mailto:(.+)", re.IGNORECASE)
 app = Flask(__name__)
 UPLOAD_FOLDER = 'uploads'
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+
+
+# --- Access control (security assessment 2026-11-25, F-29) -------------------
+# Every route requires HTTP Basic auth. Credentials come from the environment;
+# if they are not configured the app refuses all requests (fails closed).
+import hmac as _hmac
+from flask import Response as _Response
+from werkzeug.utils import secure_filename
+
+_AUTH_USER = os.getenv("APP_BASIC_AUTH_USER", "")
+_AUTH_PASSWORD = os.getenv("APP_BASIC_AUTH_PASSWORD", "")
+
+
+@app.before_request
+def _require_basic_auth():
+    if not _AUTH_USER or not _AUTH_PASSWORD:
+        return _Response("Service not configured: set APP_BASIC_AUTH_USER and APP_BASIC_AUTH_PASSWORD.", 503)
+    auth = request.authorization
+    ok = (
+        auth is not None
+        and auth.type == "basic"
+        and _hmac.compare_digest((auth.username or "").encode(), _AUTH_USER.encode())
+        and _hmac.compare_digest((auth.password or "").encode(), _AUTH_PASSWORD.encode())
+    )
+    if not ok:
+        return _Response("Authentication required", 401, {"WWW-Authenticate": 'Basic realm="data-enrichment"'})
+# -----------------------------------------------------------------------------
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 state = {
@@ -700,7 +727,9 @@ def upload_file():
     if file.filename == '':
         return jsonify({"error": "No selected file"}), 400
     if file:
-        filename = file.filename
+        filename = secure_filename(file.filename)
+        if not filename:
+            return jsonify({"error": "Invalid file name"}), 400
         filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         file.save(filepath)
         state['filename'] = filename
@@ -756,4 +785,4 @@ def index():
     return render_template('index.html')
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5671, debug=True)
+    app.run(host='0.0.0.0', port=5671, debug=False)

@@ -2,8 +2,11 @@ version: '3.8'
 services:
   web:
     build: .
-    ports:
-      - "5671:5671"
+    expose:
+      - "5671"
+    environment:
+      - APP_BASIC_AUTH_USER=${APP_BASIC_AUTH_USER}
+      - APP_BASIC_AUTH_PASSWORD=${APP_BASIC_AUTH_PASSWORD}
     volumes:
       - .:/app
       - ./templates:/app/templates
