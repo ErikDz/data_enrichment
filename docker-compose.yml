@@ -8,6 +8,6 @@ services:
       - APP_BASIC_AUTH_USER=${APP_BASIC_AUTH_USER}
       - APP_BASIC_AUTH_PASSWORD=${APP_BASIC_AUTH_PASSWORD}
     volumes:
-      - .:/app
-      - ./templates:/app/templates
-      - ./static:/app/static
+      - uploads:/app/uploads
+volumes:
+  uploads:
